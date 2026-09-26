@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.go text
+
+# The fixtures must arrive byte for byte on every platform: their CRC32 and
+# their length are checked against the trailer a real lzip wrote. Any end-of-line
+# normalisation would corrupt them, and `text=auto` only guesses.
+testdata/** -text
