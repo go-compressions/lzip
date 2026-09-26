@@ -25,6 +25,17 @@
 // tarballs, and anything a plzip pipeline produced. That is what this package
 // is for. The LZMA coding itself comes from github.com/ulikunitz/xz/lzma.
 //
+// # Memory
+//
+// The LZMA dictionary is allocated up front from the size coded in the member
+// header, before any data is decoded, because that size is the only statement
+// of it a member makes. lzip permits up to 512 MiB, so a thirty-six byte file
+// can ask for a 512 MiB allocation and there is nothing in the framing that
+// contradicts it until the trailer, which is at the far end. A program that
+// decodes .lz files it did not produce should bound that itself -- by the size
+// of the input, or by refusing files above a size it is willing to serve --
+// rather than assume a small .lz means a small decode.
+//
 // # Test corpus
 //
 // Every .lz fixture in this repository was produced by the real GNU lzip 1.26
@@ -34,4 +45,11 @@
 // magic, version 0, a wrong trailer, a truncated member -- are derived in the
 // tests by mutating those real files, so even the negative cases start from
 // bytes a real compressor wrote.
+//
+// witness_test.go goes further where it can: when lzip(1) and plzip(1) are on
+// PATH it has them compress inputs that are not in the repository, at every
+// level and at several member sizes, and checks this package against them. Those
+// tests skip on CI, which has no lzip, so what CI checks is the committed
+// corpus and what a developer's machine can add is a judge that shares no code
+// with us.
 package lzip

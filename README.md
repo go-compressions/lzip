@@ -95,6 +95,32 @@ The corpus is embedded with `//go:embed`: the emulated CI lanes ship a
 `go test -c` binary into a container with no `testdata/` directory, and a test
 that opened a file there would be vacuous on six of the eight lanes.
 
+### An outside judge
+
+`witness_test.go` uses the real `lzip` and `plzip` as a judge that shares no code
+with this package. When they are on `PATH` it has them compress inputs that are
+**not** in the repository -- incompressible data, 400 KB of zeros, a length that
+lands one byte past the 64 KiB dictionary of `lzip -0` -- at all ten levels, and
+splits a payload at four member sizes with `plzip -B`, asserting the premise each
+time (`lzip -dc` must return its own input) before judging us. It also checks
+that we refuse the mutations `lzip -t` refuses.
+
+Those tests **skip on all eight CI lanes**, which have no lzip. So what CI checks
+is the committed corpus, and the judge is what a developer's machine adds on top.
+Both matter: `testdata/generate.sh` guards against a mis-generated fixture at
+generation time, and these tests guard against one that slipped through.
+
+## Memory
+
+The LZMA dictionary is allocated up front from the size coded in the member
+header, before any data is decoded, because that size is the only statement of it
+a member makes. lzip permits up to 512 MiB, so a **thirty-six byte file can ask
+for a 512 MiB allocation** and nothing in the framing contradicts it until the
+trailer, which is at the far end. A program decoding `.lz` files it did not
+produce should bound that itself, by the size of the input or by refusing files
+larger than it is willing to serve, rather than assume a small `.lz` means a
+small decode.
+
 ## Ablations
 
 Each row is the whole test suite run against a deliberately broken copy of the
