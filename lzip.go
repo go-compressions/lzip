@@ -70,7 +70,17 @@ var (
 	// ErrMemberSize reports that the bytes consumed by a member do not
 	// match the member size in its trailer.
 	ErrMemberSize = errors.New("lzip: member size mismatch")
+	// ErrTooLarge reports a member whose coded dictionary size is valid but
+	// above the limit the reader was given: the LZMA decoder allocates the
+	// whole dictionary up front, so honouring it would let an eleven-byte file
+	// claim half a gigabyte. The dictionary is not allocated.
+	ErrTooLarge = errors.New("lzip: dictionary size exceeds the limit")
 )
+
+// DefaultMaxDictSize is the dictionary size [NewReader] accepts: 64 MiB, twice
+// what lzip -9 and plzip -9 choose (32 MiB; GNU lzip manual, "Invoking lzip",
+// level table). A file written with a larger -s needs [NewReaderLimit].
+const DefaultMaxDictSize = 64 << 20
 
 // dictSizeFromCode decodes byte 5 of a member header.
 //
@@ -128,8 +138,9 @@ var lzmaNewReader = func(r io.Reader) (io.Reader, error) { return lzma.NewReader
 
 // reader decodes the concatenation of every member in a .lz stream.
 type reader struct {
-	src *countingReader
-	lz  io.Reader
+	src     *countingReader
+	lz      io.Reader
+	maxDict int // largest coded dictionary size a member may ask for
 
 	crc   uint32 // running CRC32 of the current member's output
 	size  uint64 // uncompressed bytes of the current member
@@ -147,8 +158,21 @@ type reader struct {
 // uncompressed size must match the data produced, and the member size must
 // match the bytes consumed. Read reports the first disagreement as an error and
 // every later call returns the same one.
+//
+// A member whose header codes a dictionary above [DefaultMaxDictSize] is
+// refused with [ErrTooLarge] before the dictionary is allocated; use
+// [NewReaderLimit] to choose another ceiling.
 func NewReader(r io.Reader) (io.Reader, error) {
-	z := &reader{src: &countingReader{r: bufio.NewReader(r)}}
+	return NewReaderLimit(r, DefaultMaxDictSize)
+}
+
+// NewReaderLimit is [NewReader] with a caller-chosen ceiling on the dictionary
+// size a member may declare. The LZMA layer allocates the whole dictionary when
+// it starts a member, so this is the memory a stream can make the reader spend
+// per member, however small the stream. lzip's own range is 4 KiB to 512 MiB
+// ([ErrDictSize] outside it); a limit above 512 MiB is the same as 512 MiB.
+func NewReaderLimit(r io.Reader, maxDictSize int) (io.Reader, error) {
+	z := &reader{src: &countingReader{r: bufio.NewReader(r)}, maxDict: maxDictSize}
 	more, err := z.nextMember()
 	if err != nil {
 		return nil, err
@@ -188,6 +212,10 @@ func (z *reader) nextMember() (bool, error) {
 	dictSize, err := dictSizeFromCode(h[5])
 	if err != nil {
 		return false, err
+	}
+	if dictSize > z.maxDict {
+		return false, fmt.Errorf("%w: member %d codes %d bytes, limit %d",
+			ErrTooLarge, z.members+1, dictSize, z.maxDict)
 	}
 	lz, err := lzmaNewReader(io.MultiReader(bytes.NewReader(lzmaHeader(dictSize)), z.src))
 	if err != nil {
