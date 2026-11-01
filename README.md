@@ -21,7 +21,7 @@ _, err = io.Copy(dst, r)
 ```
 
 `CGO_ENABLED=0`. The LZMA coding itself comes from
-[`github.com/ulikunitz/xz/lzma`](https://pkg.go.dev/github.com/ulikunitz/xz/lzma);
+[`github.com/go-compressions/xz/lzma`](https://pkg.go.dev/github.com/go-compressions/xz/lzma);
 this package is the framing around it, which is why it is small.
 
 ## There is no writer, on purpose
@@ -44,10 +44,12 @@ A `.lz` file is **one or more members concatenated**. Each member is:
 | LZMA stream | raw, with **no** 13-byte `.lzma` header of its own |
 | trailer | little-endian: CRC32 of the *uncompressed* data (u32), uncompressed size (u64), size of the whole member (u64) |
 
-Because the member carries no `.lzma` header, this package synthesises one for
-the LZMA decoder: the standard properties `lc=3 lp=0 pb=2` (property byte
-`0x5d`), the decoded dictionary size, and an **unknown** uncompressed size, so
-the decoder stops at the end-of-stream marker rather than at a byte count.
+Because the member carries no `.lzma` header, the LZMA decoder is started
+headerless with the standard properties `lc=3 lp=0 pb=2` (property byte `0x5d`)
+and the decoded dictionary size; the uncompressed size is **unknown**, so the
+decoder stops at the end-of-stream marker rather than at a byte count. The
+decoder reads ahead of that marker; the surplus (the trailer, the next member)
+is handed back to the member reader before the trailer is read.
 
 All three trailer fields are checked when the member ends. A decompressor that
 does not check its own trailer is how a corrupt file becomes a silently short
@@ -115,12 +117,17 @@ generation time, and these tests guard against one that slipped through.
 
 ## Untrusted input
 
-The LZMA dictionary is allocated up front from the size coded in the member
-header, before any data is decoded (`ulikunitz/xz`'s `newBuffer` is
-`make([]byte, size+1)`), because that size is the only statement of it a member
-makes. lzip permits up to 512 MiB, so an **eleven-byte file asked for a 512 MiB
-allocation** (536 913 640 bytes, measured with `TotalAlloc`, before v0.3.0) and
-nothing in the framing contradicts it until the trailer, which is at the far end.
+The dictionary size is the only statement a member makes of its memory, and
+nothing in the framing contradicts it until the trailer, which is at the far
+end. `ulikunitz/xz`'s LZMA allocated the whole dictionary from that size before
+decoding (`newBuffer` is `make([]byte, size+1)`), so an **eleven-byte file asked
+for a 512 MiB allocation** (536 913 640 bytes, measured with `TotalAlloc`).
+The LZMA layer is now [`go-compressions/xz`](https://github.com/go-compressions/xz)
+(`lzma.Reader1Config.NewReader1`): its window starts small and **grows with the
+decoded data**, up to the dictionary, so the same eleven bytes cost kilobytes
+(`TestPlantedBombCostsKilobytes`: a member coding 512 MiB, the most lzip
+permits, allocates < 1 MiB; CI runs it as a compiled binary under `ulimit -v`
+and `GOMEMLIMIT`).
 
 ```go
 r, err := lzip.NewReader(f)                  // dictionary ceiling: 64 MiB
@@ -128,8 +135,8 @@ r, err := lzip.NewReaderLimit(f, 512<<20)    // read everything lzip can write
 r, err := lzip.NewReaderLimit(f, 1<<20)      // files known to be small
 ```
 
-A member whose coded dictionary is above the ceiling is refused with
-`ErrTooLarge`, before anything is allocated, and the ceiling holds for every
+The ceiling stays: a member whose coded dictionary is above it is refused with
+`ErrTooLarge`, before anything is allocated, and it holds for every
 member of a multi-member stream. The default, 64 MiB, is twice the 32 MiB of
 `lzip -9` and `plzip -9` (GNU lzip manual, "Invoking lzip", level table); a file
 written with a larger `-s` needs `NewReaderLimit`. The ceiling bounds memory per
@@ -137,9 +144,8 @@ member, not output: a streaming reader leaves output to its consumer
 (`io.LimitReader`). `FuzzNewReader` runs the reader under a 1 MiB ceiling on
 arbitrary bytes, with a bounded read.
 
-Left open: the dictionary is still allocated whole when a member starts, up to
-the ceiling. Allocating it as output appears would take our own LZMA decoder in
-place of `ulikunitz/xz/lzma`, which does not allow it.
+Memory now follows the data: a member allocates a window only as large as the
+output it has produced (up to its dictionary and the ceiling).
 
 ## Ablations
 

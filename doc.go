@@ -23,17 +23,18 @@
 // for no gain in ratio. What a program does need is the ability to read the .lz
 // files that already exist -- Linux distribution archives, GNU project
 // tarballs, and anything a plzip pipeline produced. That is what this package
-// is for. The LZMA coding itself comes from github.com/ulikunitz/xz/lzma.
+// is for. The LZMA coding itself comes from github.com/go-compressions/xz/lzma.
 //
 // # Memory
 //
-// The LZMA layer allocates the whole dictionary up front from the size coded in
-// the member header, before any data is decoded. lzip permits up to 512 MiB, so
-// an eleven-byte file could ask for a 512 MiB allocation (measured: 536 913 640
-// bytes) and nothing in the framing contradicts it until the trailer, which is
-// at the far end.
+// The size coded in a member header is the only statement a member makes of its
+// memory, and nothing in the framing contradicts it until the trailer, which is
+// at the far end. lzip permits up to 512 MiB. The LZMA layer allocates its
+// window lazily, growing with the decoded data, so an eleven-byte file that
+// codes 512 MiB costs kilobytes (an earlier LZMA layer allocated the whole
+// dictionary: 536 913 640 bytes).
 //
-// [NewReader] therefore refuses, with [ErrTooLarge] and before allocating, a
+// [NewReader] still refuses, as a ceiling, with [ErrTooLarge] and before allocating, a
 // member whose coded dictionary is above [DefaultMaxDictSize] (64 MiB, twice the
 // 32 MiB of lzip -9). [NewReaderLimit] takes the ceiling from the caller: pass
 // 512 MiB to read everything lzip can write, or something small for files that

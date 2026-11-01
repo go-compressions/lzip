@@ -12,7 +12,7 @@ import (
 	"hash/crc32"
 	"io"
 
-	"github.com/ulikunitz/xz/lzma"
+	"github.com/go-compressions/xz/lzma"
 )
 
 // headerSize is the size of a member header: magic (4) + version (1) + coded
@@ -38,15 +38,14 @@ const (
 	maxDictSize = 1 << 29
 )
 
-// lzmaProperties is the LZMA property byte for the parameters lzip always
-// uses: lc=3 literal context bits, lp=0 literal position bits, pb=2 position
-// bits. LZMA packs them as (pb*5+lp)*9+lc.
-const lzmaProperties = byte((2*5+0)*9 + 3)
-
-// unknownSize is the value the .lzma header uses for "the uncompressed size is
-// not recorded". It makes the LZMA decoder stop at the end-of-stream marker,
-// which is where an lzip member's LZMA stream ends.
-const unknownSize = ^uint64(0)
+// The LZMA parameters lzip always uses: lc=3 literal context bits, lp=0
+// literal position bits, pb=2 position bits. The size is not recorded: an
+// lzip member's LZMA stream ends at an end-of-stream marker.
+const (
+	lzmaLC = 3
+	lzmaLP = 0
+	lzmaPB = 2
+)
 
 // Errors reported for a malformed or corrupt stream. Each is wrapped with
 // detail, so test with [errors.Is].
@@ -71,9 +70,8 @@ var (
 	// match the member size in its trailer.
 	ErrMemberSize = errors.New("lzip: member size mismatch")
 	// ErrTooLarge reports a member whose coded dictionary size is valid but
-	// above the limit the reader was given: the LZMA decoder allocates the
-	// whole dictionary up front, so honouring it would let an eleven-byte file
-	// claim half a gigabyte. The dictionary is not allocated.
+	// above the limit the reader was given. It is a ceiling on what a member
+	// may declare, checked before the LZMA layer starts; nothing is allocated.
 	ErrTooLarge = errors.New("lzip: dictionary size exceeds the limit")
 )
 
@@ -106,40 +104,58 @@ func dictSizeFromCode(b byte) (int, error) {
 	return int(size), nil
 }
 
-// lzmaHeader synthesises the thirteen-byte .lzma header that the LZMA decoder
-// expects and an lzip member does not carry.
-func lzmaHeader(dictSize int) []byte {
-	h := make([]byte, lzma.HeaderLen)
-	h[0] = lzmaProperties
-	binary.LittleEndian.PutUint32(h[1:5], uint32(dictSize))
-	binary.LittleEndian.PutUint64(h[5:13], unknownSize)
-	return h
-}
-
-// countingReader counts the bytes handed out, which is how a member's own size
-// is measured against the figure in its trailer. It deliberately sits above the
-// buffering, so what it counts is what the member consumed and not what the
-// buffer read ahead.
+// countingReader counts the bytes a member consumed, which is how its size is
+// measured against the figure in its trailer. It sits above the buffering, so
+// what it counts is what the member consumed and not what the buffer read
+// ahead. The LZMA decoder itself reads ahead from it; once a member's end
+// marker is reached the surplus is handed back with unread, which takes it off
+// the count and serves it again before reading further.
 type countingReader struct {
-	r io.Reader
-	n int64
+	r    io.Reader
+	n    int64
+	back []byte // bytes handed back by unread, served first
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
+	if len(c.back) > 0 {
+		n := copy(p, c.back)
+		c.back = c.back[n:]
+		c.n += int64(n)
+		return n, nil
+	}
 	n, err := c.r.Read(p)
 	c.n += int64(n)
 	return n, err
 }
 
+// unread hands back the last bytes Read returned that were not used. b is
+// copied.
+func (c *countingReader) unread(b []byte) {
+	c.n -= int64(len(b))
+	c.back = append(bytes.Clone(b), c.back...)
+}
+
+// lzmaStream is the LZMA decoder of one member.
+type lzmaStream interface {
+	io.Reader
+	// Unconsumed returns what was read from the source and not used, once the
+	// end marker has been reached.
+	Unconsumed() []byte
+}
+
 // lzmaNewReader is a seam: the tests replace it to exercise the path where the
-// LZMA layer refuses the header, which cannot happen with a header this package
-// synthesises itself.
-var lzmaNewReader = func(r io.Reader) (io.Reader, error) { return lzma.NewReader(r) }
+// LZMA layer refuses to start, which cannot happen with parameters this package
+// chooses itself. maxDict is the ceiling on the window the decoder may
+// allocate; the window grows with the decoded data, never to the whole
+// dictionary size at once.
+var lzmaNewReader = func(r io.Reader, dictSize, maxDict int) (lzmaStream, error) {
+	return lzma.Reader1Config{LC: lzmaLC, LP: lzmaLP, PB: lzmaPB, DictCap: dictSize, MaxDictionary: maxDict}.NewReader1(r)
+}
 
 // reader decodes the concatenation of every member in a .lz stream.
 type reader struct {
 	src     *countingReader
-	lz      io.Reader
+	lz      lzmaStream
 	maxDict int // largest coded dictionary size a member may ask for
 
 	crc   uint32 // running CRC32 of the current member's output
@@ -169,7 +185,9 @@ func NewReader(r io.Reader) (io.Reader, error) {
 // NewReaderLimit is [NewReader] with a caller-chosen ceiling on the dictionary
 // size a member may declare. The LZMA layer allocates the whole dictionary when
 // it starts a member, so this is the memory a stream can make the reader spend
-// per member, however small the stream. lzip's own range is 4 KiB to 512 MiB
+// per member at most, and only for a member whose data really reaches back that
+// far: the window grows with the decoded data, so an eleven-byte file that
+// codes 512 MiB costs kilobytes. lzip's own range is 4 KiB to 512 MiB
 // ([ErrDictSize] outside it); a limit above 512 MiB is the same as 512 MiB.
 func NewReaderLimit(r io.Reader, maxDictSize int) (io.Reader, error) {
 	z := &reader{src: &countingReader{r: bufio.NewReader(r)}, maxDict: maxDictSize}
@@ -217,7 +235,7 @@ func (z *reader) nextMember() (bool, error) {
 		return false, fmt.Errorf("%w: member %d codes %d bytes, limit %d",
 			ErrTooLarge, z.members+1, dictSize, z.maxDict)
 	}
-	lz, err := lzmaNewReader(io.MultiReader(bytes.NewReader(lzmaHeader(dictSize)), z.src))
+	lz, err := lzmaNewReader(z.src, dictSize, z.maxDict)
 	if err != nil {
 		return false, fmt.Errorf("lzip: starting LZMA stream: %w", err)
 	}
@@ -276,6 +294,7 @@ func (z *reader) Read(p []byte) (int, error) {
 		// the trailer, then look for another member: a .lz file may hold
 		// any number of them, and stopping here would silently truncate
 		// everything a plzip pipeline wrote.
+		z.src.unread(z.lz.Unconsumed()) // the decoder reads ahead of its end marker
 		if err := z.finishMember(); err != nil {
 			z.err = err
 			return n, err

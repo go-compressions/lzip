@@ -29,6 +29,20 @@ jobs:
           if go tool cover -func=cov.out | grep -vE '100\.0%' | grep -v '^total:'; then
             echo "coverage below 100%"; exit 1
           fi
+  # The planted bomb runs as a compiled binary under a virtual memory limit and
+  # GOMEMLIMIT, so a regression fails by itself instead of allocating gigabytes
+  # of the runner.
+  bombs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with: { go-version: '1.27.3' }
+      - run: go test -c -o lzip.test .
+      - name: run under limits
+        run: |
+          ulimit -v 2097152
+          GOMEMLIMIT=256MiB ./lzip.test -test.run 'Bomb|TinyFile|DictionaryLimit' -test.v
   emulated:
     runs-on: ubuntu-latest
     strategy:
