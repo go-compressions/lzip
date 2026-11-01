@@ -9,6 +9,7 @@ A pure-Go reader for the lzip (`.lz`) compressed file format.
 
 ```go
 func NewReader(r io.Reader) (io.Reader, error)
+func NewReaderLimit(r io.Reader, maxDictSize int) (io.Reader, error) // ceiling on the dictionary a member may declare
 ```
 
 ```go
@@ -112,16 +113,33 @@ is the committed corpus, and the judge is what a developer's machine adds on top
 Both matter: `testdata/generate.sh` guards against a mis-generated fixture at
 generation time, and these tests guard against one that slipped through.
 
-## Memory
+## Untrusted input
 
 The LZMA dictionary is allocated up front from the size coded in the member
-header, before any data is decoded, because that size is the only statement of it
-a member makes. lzip permits up to 512 MiB, so a **thirty-six byte file can ask
-for a 512 MiB allocation** and nothing in the framing contradicts it until the
-trailer, which is at the far end. A program decoding `.lz` files it did not
-produce should bound that itself, by the size of the input or by refusing files
-larger than it is willing to serve, rather than assume a small `.lz` means a
-small decode.
+header, before any data is decoded (`ulikunitz/xz`'s `newBuffer` is
+`make([]byte, size+1)`), because that size is the only statement of it a member
+makes. lzip permits up to 512 MiB, so an **eleven-byte file asked for a 512 MiB
+allocation** (536 913 640 bytes, measured with `TotalAlloc`, before v0.3.0) and
+nothing in the framing contradicts it until the trailer, which is at the far end.
+
+```go
+r, err := lzip.NewReader(f)                  // dictionary ceiling: 64 MiB
+r, err := lzip.NewReaderLimit(f, 512<<20)    // read everything lzip can write
+r, err := lzip.NewReaderLimit(f, 1<<20)      // files known to be small
+```
+
+A member whose coded dictionary is above the ceiling is refused with
+`ErrTooLarge`, before anything is allocated, and the ceiling holds for every
+member of a multi-member stream. The default, 64 MiB, is twice the 32 MiB of
+`lzip -9` and `plzip -9` (GNU lzip manual, "Invoking lzip", level table); a file
+written with a larger `-s` needs `NewReaderLimit`. The ceiling bounds memory per
+member, not output: a streaming reader leaves output to its consumer
+(`io.LimitReader`). `FuzzNewReader` runs the reader under a 1 MiB ceiling on
+arbitrary bytes, with a bounded read.
+
+Left open: the dictionary is still allocated whole when a member starts, up to
+the ceiling. Allocating it as output appears would take our own LZMA decoder in
+place of `ulikunitz/xz/lzma`, which does not allow it.
 
 ## Ablations
 
