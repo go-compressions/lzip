@@ -42,6 +42,31 @@ func TestTinyFileCannotClaimAHugeDictionary(t *testing.T) {
 	}
 }
 
+// A member that codes the largest dictionary lzip permits (512 MiB, the format
+// has nothing bigger) over a few bytes of data is decoded, and costs kilobytes:
+// the window grows with the decoded data and is not allocated from the header.
+// Run under GOMEMLIMIT and ulimit -v in CI (the bombs job).
+func TestPlantedBombCostsKilobytes(t *testing.T) {
+	for _, name := range []string{"single.lz", "empty.lz", "onebyte.lz", "concat3.lz"} {
+		in := mutate(t, name, map[int]byte{5: 0x1d})
+		var out []byte
+		var err error
+		cost := allocated(func() {
+			var r io.Reader
+			r, err = NewReaderLimit(bytes.NewReader(in), 1<<29)
+			if err == nil {
+				out, err = io.ReadAll(r)
+			}
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if cost > 1<<20 {
+			t.Errorf("%s: 512 MiB declared over %d bytes allocated %d bytes, want < 1 MiB", name, len(out), cost)
+		}
+	}
+}
+
 // The limit is exact: a member coding exactly the limit is started, one byte
 // less is not. 0x14 codes 1 MiB.
 func TestDictionaryLimitIsExact(t *testing.T) {

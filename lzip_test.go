@@ -112,14 +112,11 @@ func TestDictSizeFromCodeOutOfRange(t *testing.T) {
 	}
 }
 
-func TestLZMAHeader(t *testing.T) {
-	h := lzmaHeader(229376)
-	want := []byte{0x5d, 0x00, 0x80, 0x03, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
-	if !bytes.Equal(h, want) {
-		t.Errorf("lzmaHeader(229376) = % x, want % x", h, want)
-	}
-	if lzmaProperties != 0x5d {
-		t.Errorf("lzmaProperties = %#02x, want 0x5d for lc=3 lp=0 pb=2", lzmaProperties)
+// lzip always codes lc=3 lp=0 pb=2, which the LZMA property byte packs as
+// (pb*5+lp)*9+lc = 0x5d.
+func TestLZMAProperties(t *testing.T) {
+	if p := (lzmaPB*5+lzmaLP)*9 + lzmaLC; p != 0x5d {
+		t.Errorf("properties byte = %#02x, want 0x5d for lc=3 lp=0 pb=2", p)
 	}
 }
 
@@ -354,7 +351,7 @@ func TestLZMAStartFailure(t *testing.T) {
 	saved := lzmaNewReader
 	defer func() { lzmaNewReader = saved }()
 	boom := errors.New("boom")
-	lzmaNewReader = func(io.Reader) (io.Reader, error) { return nil, boom }
+	lzmaNewReader = func(io.Reader, int, int) (lzmaStream, error) { return nil, boom }
 	if _, err := NewReader(bytes.NewReader(fixture(t, "single.lz"))); !errors.Is(err, boom) {
 		t.Errorf("NewReader error = %v, want it to wrap %v", err, boom)
 	}
@@ -370,6 +367,82 @@ func TestCountingReaderPropagatesError(t *testing.T) {
 	}
 	if c.n != 0 {
 		t.Errorf("counted %d bytes on a failed read, want 0", c.n)
+	}
+}
+
+// eofWithData wraps a member's LZMA stream so that its last bytes arrive
+// together with io.EOF, which io.Reader permits: the reader must then hand them
+// on before going to the next member.
+type eofWithData struct {
+	lzmaStream
+	out []byte
+	got bool
+}
+
+func (e *eofWithData) Read(p []byte) (int, error) {
+	if !e.got {
+		e.got = true
+		e.out, _ = io.ReadAll(e.lzmaStream)
+	}
+	n := copy(p, e.out)
+	e.out = e.out[n:]
+	if len(e.out) == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestEOFTogetherWithData(t *testing.T) {
+	saved := lzmaNewReader
+	defer func() { lzmaNewReader = saved }()
+	in := fixture(t, "concat3.lz")
+	want, err := io.ReadAll(mustReader(t, in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lzmaNewReader = func(r io.Reader, dict, max int) (lzmaStream, error) {
+		s, err := saved(r, dict, max)
+		return &eofWithData{lzmaStream: s}, err
+	}
+	got, err := io.ReadAll(mustReader(t, in))
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("err = %v, equal = %v", err, bytes.Equal(got, want))
+	}
+}
+
+func mustReader(t *testing.T, in []byte) io.Reader {
+	t.Helper()
+	r, err := NewReader(bytes.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// unread takes bytes off the count and serves them again, in order, before the
+// source is read further.
+func TestCountingReaderUnread(t *testing.T) {
+	c := &countingReader{r: bytes.NewReader([]byte("abcdefgh"))}
+	p := make([]byte, 6)
+	if n, _ := c.Read(p); n != 6 || c.n != 6 {
+		t.Fatalf("read %d, counted %d", n, c.n)
+	}
+	c.unread(p[3:6]) // "def"
+	c.unread(nil)
+	if c.n != 3 {
+		t.Fatalf("counted %d after unread, want 3", c.n)
+	}
+	small := make([]byte, 2)
+	got := []byte{}
+	for {
+		n, err := c.Read(small)
+		got = append(got, small[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	if string(got) != "defgh" || c.n != 8 {
+		t.Errorf("got %q, counted %d; want \"defgh\", 8", got, c.n)
 	}
 }
 
